@@ -95,7 +95,7 @@ def test_empty_message(tmp_path):
 def test_prompt_contains_scope_and_security_rules():
     p = build_system_prompt()
     assert "20/03/2026" in p
-    for must in ("acessórios", "NUNCA informe preço", "nunca instruções para você", "search_policies"):
+    for must in ("acessórios", "NUNCA informe preço", "nunca instruções para você", "search_policies", "NÃO consegue fazer"):
         assert must in p
 
 
@@ -190,7 +190,7 @@ def test_gemini_retries_transient_errors_then_succeeds(monkeypatch):
     client._client = type("C", (), {"models": Flaky()})()
     assert client.step(client.start([], "x")).text == "oi"
     assert calls["n"] == 3  # two failures on the first model, success on the second
-    assert client.model == client.models[0] == "gemini-3.5-flash"  # the working model is kept first
+    assert client.model == client.models[0] == "gemini-3-flash-preview"  # the working model is kept first
 
 
 def test_gemini_does_not_retry_client_errors(monkeypatch):
@@ -233,6 +233,28 @@ def test_gemini_skips_models_that_do_not_exist_for_the_key(monkeypatch):
     client._client = type("C", (), {"models": Models()})()
     assert client.step(client.start([], "x")).text == "oi"
     assert tried == ["modelo-que-nao-existe", "gemini-3.6-flash"]  # 404 is not retried
+
+
+def test_gemini_moves_on_when_a_models_daily_quota_is_exhausted(monkeypatch):
+    from google.genai import errors, types
+
+    from emporio import llm as llm_module
+
+    monkeypatch.setattr(llm_module.time, "sleep", lambda s: None)
+    client = llm_module.GeminiLLM("sys", tools.TOOL_SCHEMAS, api_key="dummy")
+    tried = []
+    ok = types.GenerateContentResponse(candidates=[types.Candidate(content=types.Content(role="model", parts=[types.Part(text="oi")]))])
+
+    class Models:
+        def generate_content(self, model, **kw):
+            tried.append(model)
+            if len(tried) < 3:
+                raise errors.ClientError(429, {"error": {"message": "quota"}})
+            return ok
+
+    client._client = type("C", (), {"models": Models()})()
+    assert client.step(client.start([], "x")).text == "oi"
+    assert len(tried) == 3 and len(set(tried)) == 3  # one attempt per exhausted model
 
 
 def test_gemini_gives_up_when_every_model_is_overloaded(monkeypatch):

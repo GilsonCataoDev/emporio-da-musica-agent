@@ -15,8 +15,11 @@ from typing import Any, Protocol
 
 # Preview-era Gemini models are often overloaded (503/504), so the agent walks a chain:
 # GEMINI_MODEL (if set) first, then these, each tried a couple of times before moving on.
-DEFAULT_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.8-flash")
-RETRY_CODES = {429, 500, 502, 503, 504}
+DEFAULT_MODELS = (
+    "gemini-3.6-flash", "gemini-3-flash-preview", "gemini-3.5-flash",
+    "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.8-flash",
+)
+RETRY_CODES = {500, 502, 503, 504}  # 429 moves to the next model: free-tier quotas are per model and per day
 ATTEMPTS_PER_MODEL = 2
 BACKOFF_SECONDS = 2.0  # wait before the second attempt on the same model
 
@@ -101,8 +104,8 @@ class GeminiLLM:
         """Call the model; on transient errors (overload, rate limit) retry, then try the next model.
 
         A model that answered once stays first for later calls. Errors that retrying cannot fix
-        (bad request, auth, unknown model) are raised right away, except a missing model, which
-        just moves on to the next one in the chain.
+        (bad request, auth) are raised right away. A missing model or an exhausted quota moves on to the
+        next model in the chain.
         """
         from google.genai import errors
 
@@ -119,8 +122,8 @@ class GeminiLLM:
                     return response
                 except errors.APIError as exc:
                     last = exc
-                    if exc.code == 404:
-                        break  # model not available to this key: try the next one
+                    if exc.code in (404, 429):
+                        break  # model unavailable or out of quota for this key: try the next one
                     if exc.code not in RETRY_CODES:
                         raise
                     if attempt < ATTEMPTS_PER_MODEL:

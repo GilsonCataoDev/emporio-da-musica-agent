@@ -55,6 +55,16 @@ def test_unavailable_products_are_reported_with_alternatives(name, expected):
     assert all(a["estoque"] > 0 and a["product_id"] != info["product_id"] for a in info["alternativas"])
 
 
+def test_alternatives_match_the_kind_of_instrument_before_price():
+    import json
+
+    info = tools.get_product("Shelby SN-7C")  # nylon, no electronics
+    con = tools.connect()
+    for alt in info["alternativas"]:
+        specs = json.loads(con.execute("SELECT specs FROM products WHERE product_id=?", (alt["product_id"],)).fetchone()[0])
+        assert specs["strings"] == "nylon" and specs["electronics"] == "no", alt["nome"]
+
+
 def test_search_hides_discontinued_even_with_stock():
     ids = {p["product_id"] for p in tools.search_products(limit=20)["produtos"]}
     assert 113 not in ids  # discontinued, no stock
@@ -189,6 +199,25 @@ def test_max_installments(amount, expected):
 
 def test_payment_pix_value():
     assert tools.get_payment_options(1000)["pix"]["valor"] == 950.0
+
+
+def test_payment_for_promotional_product_has_no_pix_discount():
+    res = tools.get_payment_options(product_id=94)  # Taylor 110e, 8% promotion
+    assert res["valor"] == pytest.approx(5519.08, abs=0.01)
+    assert res["preco_promocional"] is True
+    assert res["pix"]["valor"] is None
+    assert res["credito"]["parcelas_maximas"] == 12
+
+
+def test_payment_for_regular_product_uses_its_price():
+    res = tools.get_payment_options(product_id=95)  # Takamine GD20, no promotion
+    assert res["valor"] == 2199.0 and res["pix"]["valor"] == pytest.approx(2089.05, abs=0.01)
+
+
+def test_payment_needs_an_amount_or_a_product():
+    assert "erro" in tools.get_payment_options()
+    assert "erro" in tools.get_payment_options(product_id=99999)
+    assert "erro" in tools.get_payment_options(-5)
 
 
 def test_shipping_local_and_remote():

@@ -157,12 +157,20 @@ def get_product(name_or_id: str) -> dict[str, Any]:
     if not sellable:
         if row["status"] == "active":
             info["situacao"] = "temporariamente sem estoque"
-        alternatives = con.execute(
+        candidates = con.execute(
             f"{_PRODUCT_SQL} WHERE p.category_id = ? AND p.status = 'active' "
-            "AND p.stock_quantity > 0 AND p.product_id != ? "
-            "ORDER BY ABS(p.price_brl - ?) LIMIT 3",
-            (row["category_id"], row["product_id"], row["price_brl"]),
+            "AND p.stock_quantity > 0 AND p.product_id != ?",
+            (row["category_id"], row["product_id"]),
         ).fetchall()
+        wanted = json.loads(row["specs"]) if row["specs"] else {}
+
+        def distance(candidate) -> tuple:
+            """Same kind of instrument first (strings, electronics), then closest price."""
+            specs = json.loads(candidate["specs"]) if candidate["specs"] else {}
+            mismatches = sum(1 for key in ("strings", "electronics") if wanted.get(key) != specs.get(key))
+            return (mismatches, abs(candidate["price_brl"] - row["price_brl"]))
+
+        alternatives = sorted(candidates, key=distance)[:3]
         info["alternativas"] = [_product_summary(con, a) for a in alternatives]
     return info
 
@@ -333,30 +341,49 @@ def search_policies(query: str, top_k: int = 3) -> dict[str, Any]:
 
 # ----------------------------------------------------------------------- payment & shipping
 
-def get_payment_options(amount: float) -> dict[str, Any]:
-    """Payment methods and installment limits for a purchase amount (policy section 3)."""
+def get_payment_options(amount: float | None = None, product_id: int | None = None) -> dict[str, Any]:
+    """Payment methods and installment limits (policy section 3).
+
+    Pass `product_id` to price a single product: the current price is used and the PIX discount
+    is withheld when the product has an active promotion (policy 6.2). `amount` alone is treated
+    as a regular-priced total.
+    """
+    promotional = False
+    if product_id is not None:
+        con = connect()
+        row = con.execute("SELECT product_id, price_brl, name FROM products WHERE product_id = ?", (int(product_id),)).fetchone()
+        if row is None:
+            return {"erro": f"Produto {product_id} não encontrado."}
+        price = _price_block(con, row["product_id"], row["price_brl"])
+        promotional = price["promocao"] is not None
+        amount = price["preco_atual"]
+    if amount is None:
+        return {"erro": "Informe o valor da compra (amount) ou o código do produto (product_id)."}
     amount = float(amount)
     if amount <= 0:
         return {"erro": "O valor deve ser maior que zero."}
 
-    def max_installments() -> int:
-        best = 1
-        for n in range(2, 13):
-            parcel = amount / n
-            min_parcel = 0.0 if n <= 3 else 80.0 if n <= 6 else 100.0
-            if n <= 3 and parcel < 50.0:
-                break
-            if parcel >= min_parcel:
-                best = n
-        return best
+    best = 1
+    for n in range(2, 13):
+        parcel = amount / n
+        min_parcel = 0.0 if n <= 3 else 80.0 if n <= 6 else 100.0
+        if n <= 3 and parcel < 50.0:
+            break
+        if parcel >= min_parcel:
+            best = n
 
-    n = max_installments()
+    pix = (
+        {"valor": None, "regra": "O desconto de 5% do PIX não se aplica a preços promocionais; pagar no PIX custa o mesmo valor."}
+        if promotional
+        else {"valor": _money(amount * (1 - PIX_DISCOUNT)), "regra": "5% de desconto sobre o preço de tabela"}
+    )
     return {
         "valor": _money(amount),
-        "pix": {"valor": _money(amount * (1 - PIX_DISCOUNT)), "regra": "5% de desconto, exceto sobre preços promocionais"},
+        "preco_promocional": promotional,
+        "pix": pix,
         "debito": "à vista, todas as bandeiras",
         "boleto": "à vista, compensação em até 3 dias úteis",
-        "credito": {"parcelas_maximas": n, "valor_da_parcela": _money(amount / n), "juros": "sem juros"},
+        "credito": {"parcelas_maximas": best, "valor_da_parcela": _money(amount / best), "juros": "sem juros"},
         "combinar_formas_de_pagamento": amount > 2000,
     }
 
@@ -447,9 +474,14 @@ TOOL_SCHEMAS = [
     ),
     _schema(
         "get_payment_options",
-        "Formas de pagamento, valor no PIX e número máximo de parcelas para um valor de compra.",
-        {"amount": {"type": "number"}},
-        ["amount"],
+        "Formas de pagamento, valor no PIX e número máximo de parcelas. Para um produto específico, "
+        "SEMPRE passe product_id (assim o PIX respeita as promoções). Use amount apenas para um total "
+        "de várias peças ou valor avulso.",
+        {
+            "product_id": {"type": "integer", "description": "Código retornado por get_product ou search_products; nunca invente."},
+            "amount": {"type": "number"},
+        },
+        [],
     ),
     _schema(
         "get_shipping_info",
