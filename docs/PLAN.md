@@ -1,4 +1,4 @@
-# Project plan
+# Original plan (kept for reference; the README describes what was built)
 
 Customer-service agent for Empório da Música (fictional musical instrument store, Campo Grande/MS).
 
