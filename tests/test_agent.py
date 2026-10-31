@@ -168,3 +168,88 @@ def test_gemini_empty_candidates_gives_empty_step():
     llm._client = type("C", (), {"models": type("M", (), {
         "generate_content": lambda self, **kw: types.GenerateContentResponse(candidates=[])})()})()
     assert llm.step(llm.start([], "oi")).text == ""
+
+
+def test_gemini_retries_transient_errors_then_succeeds(monkeypatch):
+    from google.genai import errors, types
+
+    from emporio import llm as llm_module
+
+    monkeypatch.setattr(llm_module.time, "sleep", lambda s: None)
+    client = llm_module.GeminiLLM("sys", tools.TOOL_SCHEMAS, api_key="dummy")
+    calls = {"n": 0}
+    ok = types.GenerateContentResponse(candidates=[types.Candidate(content=types.Content(role="model", parts=[types.Part(text="oi")]))])
+
+    class Flaky:
+        def generate_content(self, **kw):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise errors.ServerError(503, {"error": {"message": "busy"}})
+            return ok
+
+    client._client = type("C", (), {"models": Flaky()})()
+    assert client.step(client.start([], "x")).text == "oi"
+    assert calls["n"] == 3  # two failures on the first model, success on the second
+    assert client.model == client.models[0] == "gemini-3.5-flash"  # the working model is kept first
+
+
+def test_gemini_does_not_retry_client_errors(monkeypatch):
+    from google.genai import errors
+
+    from emporio import llm as llm_module
+
+    monkeypatch.setattr(llm_module.time, "sleep", lambda s: None)
+    client = llm_module.GeminiLLM("sys", tools.TOOL_SCHEMAS, api_key="dummy")
+    calls = {"n": 0}
+
+    class Bad:
+        def generate_content(self, **kw):
+            calls["n"] += 1
+            raise errors.ClientError(400, {"error": {"message": "bad request"}})
+
+    client._client = type("C", (), {"models": Bad()})()
+    with pytest.raises(errors.ClientError):
+        client.step(client.start([], "x"))
+    assert calls["n"] == 1
+
+
+def test_gemini_skips_models_that_do_not_exist_for_the_key(monkeypatch):
+    from google.genai import errors, types
+
+    from emporio import llm as llm_module
+
+    monkeypatch.setattr(llm_module.time, "sleep", lambda s: None)
+    client = llm_module.GeminiLLM("sys", tools.TOOL_SCHEMAS, model="modelo-que-nao-existe", api_key="dummy")
+    tried = []
+    ok = types.GenerateContentResponse(candidates=[types.Candidate(content=types.Content(role="model", parts=[types.Part(text="oi")]))])
+
+    class Models:
+        def generate_content(self, model, **kw):
+            tried.append(model)
+            if model == "modelo-que-nao-existe":
+                raise errors.ClientError(404, {"error": {"message": "gone"}})
+            return ok
+
+    client._client = type("C", (), {"models": Models()})()
+    assert client.step(client.start([], "x")).text == "oi"
+    assert tried == ["modelo-que-nao-existe", "gemini-3.6-flash"]  # 404 is not retried
+
+
+def test_gemini_gives_up_when_every_model_is_overloaded(monkeypatch):
+    from google.genai import errors
+
+    from emporio import llm as llm_module
+
+    monkeypatch.setattr(llm_module.time, "sleep", lambda s: None)
+    client = llm_module.GeminiLLM("sys", tools.TOOL_SCHEMAS, api_key="dummy")
+    n = {"n": 0}
+
+    class Down:
+        def generate_content(self, **kw):
+            n["n"] += 1
+            raise errors.ServerError(503, {"error": {"message": "busy"}})
+
+    client._client = type("C", (), {"models": Down()})()
+    with pytest.raises(errors.ServerError):
+        client.step(client.start([], "x"))
+    assert n["n"] == len(client.models) * llm_module.ATTEMPTS_PER_MODEL

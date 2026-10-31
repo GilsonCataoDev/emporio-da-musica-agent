@@ -9,10 +9,16 @@ agent loop and lets tests run against a scripted fake model.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+# Preview-era Gemini models are often overloaded (503/504), so the agent walks a chain:
+# GEMINI_MODEL (if set) first, then these, each tried a couple of times before moving on.
+DEFAULT_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.8-flash")
+RETRY_CODES = {429, 500, 502, 503, 504}
+ATTEMPTS_PER_MODEL = 2
+BACKOFF_SECONDS = 2.0  # wait before the second attempt on the same model
 
 
 @dataclass
@@ -49,8 +55,10 @@ class GeminiLLM:
                 "https://aistudio.google.com/apikey"
             )
         self._types = types
-        self._client = genai.Client(api_key=key)
-        self.model = model or os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
+        self._client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=45_000))  # ms
+        preferred = model or os.environ.get("GEMINI_MODEL")
+        self.models = [preferred, *[m for m in DEFAULT_MODELS if m != preferred]] if preferred else list(DEFAULT_MODELS)
+        self.model = self.models[0]
         declarations = [
             types.FunctionDeclaration(
                 name=s["name"], description=s["description"], parameters_json_schema=s["parameters"]
@@ -75,9 +83,7 @@ class GeminiLLM:
         return contents
 
     def step(self, state: list) -> Step:
-        response = self._client.models.generate_content(
-            model=self.model, contents=state, config=self._config
-        )
+        response = self._generate(state)
         if not response.candidates or not response.candidates[0].content:
             return Step(text="")
         content = response.candidates[0].content
@@ -90,6 +96,37 @@ class GeminiLLM:
             for p in (content.parts or []) if getattr(p, "function_call", None)
         ]
         return Step(text=text.strip(), tool_calls=calls)
+
+    def _generate(self, contents: list):
+        """Call the model; on transient errors (overload, rate limit) retry, then try the next model.
+
+        A model that answered once stays first for later calls. Errors that retrying cannot fix
+        (bad request, auth, unknown model) are raised right away, except a missing model, which
+        just moves on to the next one in the chain.
+        """
+        from google.genai import errors
+
+        last: Exception | None = None
+        for index, model in enumerate(self.models):
+            for attempt in range(1, ATTEMPTS_PER_MODEL + 1):
+                try:
+                    response = self._client.models.generate_content(
+                        model=model, contents=contents, config=self._config
+                    )
+                    if index:
+                        self.models.insert(0, self.models.pop(index))
+                        self.model = model
+                    return response
+                except errors.APIError as exc:
+                    last = exc
+                    if exc.code == 404:
+                        break  # model not available to this key: try the next one
+                    if exc.code not in RETRY_CODES:
+                        raise
+                    if attempt < ATTEMPTS_PER_MODEL:
+                        time.sleep(BACKOFF_SECONDS)
+        assert last is not None
+        raise last
 
     def add_results(self, state: list, calls: list[ToolCall], results: list[dict[str, Any]]) -> None:
         t = self._types
