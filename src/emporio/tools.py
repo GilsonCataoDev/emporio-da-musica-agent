@@ -121,6 +121,38 @@ def search_products(
     return {"total_encontrado": len(results), "produtos": results[:limit]}
 
 
+# Words customers add around a product name that the catalog names do not use.
+_GENERIC_WORDS = {
+    "de", "da", "do", "dos", "das", "o", "a", "os", "as", "um", "uma", "e", "com", "para", "por",
+    "favor", "quero", "queria", "preco", "valor", "quanto", "custa", "esse", "este", "modelo",
+    "violao", "violoes", "guitarra", "baixo", "teclado", "piano", "bateria", "ukulele", "instrumento",
+}
+
+
+def _match_by_name(rows, wanted: list[str]) -> list:
+    """Products whose name contains every wanted token."""
+    return [r for r in rows if all(t in normalize(r["name"]) for t in wanted)]
+
+
+def _find_by_name(con, query: str) -> list:
+    """Match a free-text product name. Extra words ("violão", "de") must not block a match.
+
+    First every word has to appear in the name. If nothing matches, generic words that appear
+    in no product name ("violão", "de") are dropped and the rest must match. Brands and model
+    codes are never dropped, so "Fender Stratocaster" and "Taylor 999" find nothing.
+    """
+    wanted = tokens(query)
+    rows = con.execute(_PRODUCT_SQL).fetchall()
+    found = _match_by_name(rows, wanted)
+    if found:
+        return found
+    vocabulary = {t for r in rows for t in tokens(r["name"])}
+    kept = [t for t in wanted if t in vocabulary or t not in _GENERIC_WORDS]
+    if not kept or kept == wanted:
+        return []
+    return _match_by_name(rows, kept)
+
+
 def get_product(name_or_id: str) -> dict[str, Any]:
     """Look up one product by id or name, including discontinued ones, with alternatives if unavailable."""
     con = connect()
@@ -128,16 +160,9 @@ def get_product(name_or_id: str) -> dict[str, Any]:
     if str(name_or_id).strip().isdigit():
         row = con.execute(f"{_PRODUCT_SQL} WHERE p.product_id = ?", (int(name_or_id),)).fetchone()
     if row is None:
-        wanted = tokens(str(name_or_id))
-        if not wanted:
+        if not tokens(str(name_or_id)):
             return {"erro": "Informe o nome ou o código do produto."}
-        best, best_hits = [], 0
-        for r in con.execute(f"{_PRODUCT_SQL}").fetchall():
-            name = normalize(r["name"])
-            hits = sum(1 for t in wanted if t in name)
-            if hits == len(wanted) and hits >= best_hits:
-                best = best + [r] if hits == best_hits else [r]
-                best_hits = hits
+        best = _find_by_name(con, str(name_or_id))
         if not best:
             return {"encontrado": False, "mensagem": "Nenhum produto com esse nome no catálogo."}
         if len(best) > 1:
@@ -341,14 +366,27 @@ def search_policies(query: str, top_k: int = 3) -> dict[str, Any]:
 
 # ----------------------------------------------------------------------- payment & shipping
 
+def _is_promotional_price(con, amount: float) -> bool:
+    """True if `amount` is the current price of some product with an active promotion."""
+    rows = con.execute(
+        "SELECT p.price_brl, pr.discount_percent FROM promotions pr "
+        "JOIN products p USING (product_id) WHERE pr.is_active = 1"
+    ).fetchall()
+    return any(abs(_money(r["price_brl"] * (1 - r["discount_percent"] / 100)) - amount) < 0.01 for r in rows)
+
+
 def get_payment_options(amount: float | None = None, product_id: int | None = None) -> dict[str, Any]:
     """Payment methods and installment limits (policy section 3).
 
     Pass `product_id` to price a single product: the current price is used and the PIX discount
     is withheld when the product has an active promotion (policy 6.2). `amount` alone is treated
-    as a regular-priced total.
+    as a regular-priced total, unless it equals the current price of a product on promotion: then
+    the PIX discount is withheld too, so a promotional price passed as a bare amount cannot
+    pick up a discount the policy forbids.
     """
     promotional = False
+    if product_id is None and amount is not None:
+        promotional = _is_promotional_price(connect(), float(amount))
     if product_id is not None:
         con = connect()
         row = con.execute("SELECT product_id, price_brl, name FROM products WHERE product_id = ?", (int(product_id),)).fetchone()
@@ -388,10 +426,19 @@ def get_payment_options(amount: float | None = None, product_id: int | None = No
     }
 
 
+_STATE_WORDS = {"ms", "mato", "grosso", "do", "sul", "brasil", "br"}
+
+
+def _is_campo_grande(city: str) -> bool:
+    """True for "Campo Grande" written with a state suffix ("Campo Grande/MS", "campo grande - ms")."""
+    words = tokens(city or "")
+    return words[:2] == ["campo", "grande"] and all(w in _STATE_WORDS for w in words[2:])
+
+
 def get_shipping_info(city: str, order_total: float) -> dict[str, Any]:
     """Shipping cost and lead time (policy section 5)."""
     total = float(order_total)
-    if normalize(city or "").strip() == "campo grande":
+    if _is_campo_grande(city):
         fee = 0.0 if total > FREE_SHIPPING_MIN else LOCAL_SHIPPING_FEE
         return {
             "regiao": "Campo Grande (entrega própria por motoboy)",

@@ -47,7 +47,7 @@ emporio --session maria --new     # separate, resettable conversation history
 Run the tests (no API key needed) and the evaluation (needs the key):
 
 ```bash
-pytest                            # 60 tests, offline
+pytest                            # 89 tests, offline
 python eval/run.py                # 11 scenarios against the real model, writes eval/results.md
 python eval/run.py --only return --examples
 ```
@@ -136,7 +136,7 @@ The brief says to document reasonable interpretations; these are the ones that m
 - **Receipt date.** The data only has an estimated delivery date, so it stands in for the receipt date when counting the 7-day window (4.1 and 4.3). The tool says so in its output.
 - **Defects.** Exchange for a defect is 30 days from purchase (4.2). After that, the 90-day legal warranty from receipt (8.1) is mentioned as the next step, and the case goes to the team.
 - **Online orders.** Policy 4.1 covers online purchases; every order in the data is treated as one.
-- **Metropolitan region.** The manual does not list which cities it includes, so only Campo Grande gets the local rate (free above R$ 500, otherwise R$ 35). Other cities get the Correios/Jadlog options with a note that the price is calculated at checkout.
+- **Metropolitan region.** The manual does not list which cities it includes, so only Campo Grande (also written "Campo Grande/MS") gets the local rate (free above R$ 500, otherwise R$ 35). Other cities get the Correios/Jadlog options with a note that the price is calculated at checkout.
 - **Installments.** Section 3.1 (minimum parcel R$ 80 for 4 to 6x and R$ 100 for 7 to 12x) is applied; section 3's table says R$ 100 for all credit, and 3.1 is the more detailed rule.
 - **Contact details.** The manual lists two numbers: (67) 3341-4444 as phone/WhatsApp (1.2) and (67) 3321-4500 as the WhatsApp channel (7). The agent looks the contact up in the manual instead of hard-coding one; the generic error message uses the section 7 number.
 - **Identity.** E-mail or phone matching the order is accepted as proof of ownership. That is a prototype-grade check.
@@ -148,7 +148,8 @@ The brief says to document reasonable interpretations; these are the ones that m
 - **Retrieval is lexical.** BM25 handles the manual well, but a customer who describes a policy in unusual words may miss it. A hybrid with embeddings is the first thing I would add if the manual grew.
 - **Free-tier fragility.** Quota and overload are handled with retries and fallback, but a busy day can still return the apology message. Because of the 20-requests-a-day limit, the recorded examples were produced by whichever model in the chain was available (each transcript names its model), not by a single pinned one.
 - **Evaluation checks facts, not tone.** `eval/` verifies tool use, prices, dates, refusals and leaks (11 scenarios). Tone and phrasing were reviewed by reading the transcripts. There is no repeated-run measurement of variance.
-- **Product matching is simple.** `get_product` matches name tokens; a very vague name returns a list of options instead of guessing.
+- **Product matching is simple.** `get_product` matches name tokens and ignores a short list of generic words ("violão", "de"); brands and model codes are never ignored, and a very vague name returns a list of options instead of guessing.
+- **Promotions and bare amounts.** `get_payment_options` withholds the PIX discount for a promotional product when it gets a `product_id`, or an amount equal to a promotional price. A total built from several items cannot be told apart from a regular one, so it gets the PIX discount.
 - **One language, text only.** No streaming, no voice, no Spanish or English.
 - **History is text only** and capped at the last 30 messages.
 

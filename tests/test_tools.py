@@ -73,6 +73,26 @@ def test_search_hides_discontinued_even_with_stock():
     assert 96 not in ids   # active but out of stock
 
 
+@pytest.mark.parametrize(
+    "query",
+    ["Shelby SN-7C", "violão Shelby SN-7C", "Shelby SN-7C de 7 cordas", "o violão shelby sn-7c, por favor"],
+)
+def test_product_name_with_extra_words_still_matches(query):
+    res = tools.get_product(query)
+    assert res["encontrado"] is True and res["nome"] == "Shelby SN-7C 7 Cordas Nylon Natural"
+
+
+def test_extra_words_do_not_turn_a_missing_model_into_a_match():
+    assert tools.get_product("Taylor 999")["encontrado"] is False   # a model code is never dropped
+    assert tools.get_product("violão Stradivarius Dourado")["encontrado"] is False  # unknown brand is not generic
+    assert tools.get_product("violão Gibson Les Paul")["encontrado"] is True        # real product, extra word dropped
+
+
+def test_vague_name_with_extra_words_still_asks_to_specify():
+    res = tools.get_product("violão Taylor")
+    assert res["encontrado"] is False and len(res["opcoes"]) > 1
+
+
 def test_unknown_product():
     assert tools.get_product("Fender Stratocaster Dourada")["encontrado"] is False
 
@@ -209,6 +229,21 @@ def test_payment_for_promotional_product_has_no_pix_discount():
     assert res["credito"]["parcelas_maximas"] == 12
 
 
+@pytest.mark.parametrize("product_id", [127, 121, 90, 94])  # the four active promotions
+def test_promotional_price_passed_as_a_bare_amount_gets_no_pix_discount(product_id):
+    price = tools.get_payment_options(product_id=product_id)["valor"]
+    by_amount = tools.get_payment_options(amount=price)
+    assert by_amount["preco_promocional"] is True
+    assert by_amount["pix"]["valor"] is None
+
+
+def test_regular_amounts_still_get_the_pix_discount():
+    for amount in (1000, 2199.0, 5999.0):   # 5999 is Taylor 110e's list price, not its promotional one
+        res = tools.get_payment_options(amount=amount)
+        assert res["preco_promocional"] is False
+        assert res["pix"]["valor"] == pytest.approx(amount * 0.95, abs=0.01)
+
+
 def test_payment_for_regular_product_uses_its_price():
     res = tools.get_payment_options(product_id=95)  # Takamine GD20, no promotion
     assert res["valor"] == 2199.0 and res["pix"]["valor"] == pytest.approx(2089.05, abs=0.01)
@@ -224,6 +259,19 @@ def test_shipping_local_and_remote():
     assert tools.get_shipping_info("Campo Grande", 500)["frete"] == 35.0   # "acima de" 500
     assert tools.get_shipping_info("campo grande", 500.01)["frete"] == 0.0
     assert tools.get_shipping_info("São Paulo", 900)["frete"] is None
+
+
+@pytest.mark.parametrize(
+    "city", ["Campo Grande", "campo grande", "Campo Grande/MS", "Campo Grande - MS", "campo grande, ms", "Campo Grande MS"]
+)
+def test_shipping_recognises_campo_grande_with_a_state_suffix(city):
+    res = tools.get_shipping_info(city, 600)
+    assert res["frete"] == 0.0 and res["frete_gratis"] is True
+
+
+@pytest.mark.parametrize("city", ["Campo Grande do Norte", "Campo Grande/AL", "Campo Largo", "Dourados/MS", "Grande Campo"])
+def test_shipping_does_not_mistake_other_cities_for_campo_grande(city):
+    assert tools.get_shipping_info(city, 600)["frete"] is None
 
 
 def test_call_tool_handles_bad_input():

@@ -8,6 +8,7 @@ agent loop and lets tests run against a scripted fake model.
 
 from __future__ import annotations
 
+import importlib
 import os
 import time
 from dataclasses import dataclass, field
@@ -22,6 +23,27 @@ DEFAULT_MODELS = (
 RETRY_CODES = {500, 502, 503, 504}  # 429 moves to the next model: free-tier quotas are per model and per day
 ATTEMPTS_PER_MODEL = 2
 BACKOFF_SECONDS = 2.0  # wait before the second attempt on the same model
+
+
+def _network_errors() -> tuple[tuple[type[BaseException], ...], tuple[type[BaseException], ...]]:
+    """(timeouts, other transport errors) raised by the SDK's HTTP client.
+
+    The SDK does not wrap these in `errors.APIError`, so without this a slow or unreachable
+    model would end the turn instead of moving on to the next model in the chain.
+    """
+    timeouts: list[type[BaseException]] = [TimeoutError]
+    transport: list[type[BaseException]] = [ConnectionError]
+    for name in ("httpx", "httpx2"):  # the SDK accepts either client
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        timeouts.append(module.TimeoutException)
+        transport.append(module.TransportError)
+    return tuple(timeouts), tuple(transport)
+
+
+TIMEOUT_ERRORS, TRANSPORT_ERRORS = _network_errors()
 
 
 @dataclass
@@ -104,8 +126,8 @@ class GeminiLLM:
         """Call the model; on transient errors (overload, rate limit) retry, then try the next model.
 
         A model that answered once stays first for later calls. Errors that retrying cannot fix
-        (bad request, auth) are raised right away. A missing model or an exhausted quota moves on to the
-        next model in the chain.
+        (bad request, auth) are raised right away. A missing model, an exhausted quota or a timeout
+        moves on to the next model in the chain (a model that hung once will likely hang again).
         """
         from google.genai import errors
 
@@ -126,6 +148,13 @@ class GeminiLLM:
                         break  # model unavailable or out of quota for this key: try the next one
                     if exc.code not in RETRY_CODES:
                         raise
+                    if attempt < ATTEMPTS_PER_MODEL:
+                        time.sleep(BACKOFF_SECONDS)
+                except TIMEOUT_ERRORS as exc:
+                    last = exc
+                    break
+                except TRANSPORT_ERRORS as exc:
+                    last = exc
                     if attempt < ATTEMPTS_PER_MODEL:
                         time.sleep(BACKOFF_SECONDS)
         assert last is not None
